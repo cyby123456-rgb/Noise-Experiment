@@ -98,8 +98,11 @@ def main_task(config):
     config_batch_size = config.data.batch_size
     num_batch = -(-total_samples // config_batch_size)
     output_lst = [[] for _ in range(config.data.n_samples)]
+    compute_response_ppl = bool(config.data.get("compute_response_ppl", False))
     analysis_enabled = bool(config.analysis.get("enable", False))
     use_rollout_policy_stats = analysis_enabled and validation_noise_cfg is not None
+    if compute_response_ppl and (config.rollout.name != "vllm" or config.rollout.mode != "sync"):
+        raise ValueError("data.compute_response_ppl requires synchronous vLLM rollout.")
     if use_rollout_policy_stats and (config.rollout.name != "vllm" or config.rollout.mode != "sync"):
         raise ValueError("Noisy generation analysis requires synchronous vllm rollout policy statistics.")
     chosen_logprob_lst = [[] for _ in range(config.data.n_samples)] if analysis_enabled else None
@@ -109,6 +112,9 @@ def main_task(config):
     topk_logprobs_lst = [[] for _ in range(config.data.n_samples)] if use_rollout_policy_stats else None
     topk_logits_lst = [[] for _ in range(config.data.n_samples)] if analysis_enabled else None
     chosen_logits_lst = [[] for _ in range(config.data.n_samples)] if analysis_enabled else None
+    response_ppl_lst = [[] for _ in range(config.data.n_samples)] if compute_response_ppl else None
+    response_mean_logprob_lst = [[] for _ in range(config.data.n_samples)] if compute_response_ppl else None
+    response_length_lst = [[] for _ in range(config.data.n_samples)] if compute_response_ppl else None
 
     for batch_idx in range(num_batch):
         print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
@@ -145,6 +151,8 @@ def main_task(config):
         if use_rollout_policy_stats:
             data.meta_info["return_rollout_policy_stats"] = True
             data.meta_info["analysis_top_k"] = int(config.analysis.top_k)
+        elif compute_response_ppl:
+            data.meta_info["return_rollout_log_probs"] = True
 
         data_padded, pad_size = pad_dataproto_to_divisor(data, wg.world_size)
 
@@ -159,11 +167,17 @@ def main_task(config):
                 if use_rollout_policy_stats:
                     policy_stats = output
                 else:
-                    output.meta_info["validate"] = data.meta_info["validate"]
-                    output.meta_info["recompute_log_prob"] = False
-                    output.meta_info["temperature"] = config.rollout.val_kwargs.temperature if data.meta_info["validate"] else config.rollout.temperature
-                    output.meta_info["analysis_top_k"] = int(config.analysis.top_k)
-                    policy_stats = wg.analyze_generation_policy(output)
+                    # The worker group can only split a batch evenly across its
+                    # data-parallel ranks. Analyze the padded output first, then
+                    # remove the synthetic rows to restore alignment with output.
+                    output_padded.meta_info["validate"] = data.meta_info["validate"]
+                    output_padded.meta_info["recompute_log_prob"] = False
+                    output_padded.meta_info["temperature"] = (
+                        config.rollout.val_kwargs.temperature if data.meta_info["validate"] else config.rollout.temperature
+                    )
+                    output_padded.meta_info["analysis_top_k"] = int(config.analysis.top_k)
+                    policy_stats_padded = wg.analyze_generation_policy(output_padded)
+                    policy_stats = unpad_dataproto(policy_stats_padded, pad_size=pad_size)
 
             output_texts = []
             for i in range(len(output)):
@@ -173,6 +187,20 @@ def main_task(config):
                 valid_response_ids = data_item.batch["responses"][:valid_response_length]
                 response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
                 output_texts.append(response_str)
+
+                if compute_response_ppl:
+                    valid_len = int(valid_response_length.item()) if hasattr(valid_response_length, "item") else int(valid_response_length)
+                    token_logprobs = data_item.batch["rollout_log_probs"][:valid_len].float()
+                    if valid_len <= 0:
+                        mean_logprob = float("nan")
+                        ppl = float("nan")
+                    else:
+                        mean_logprob = float(token_logprobs.mean().item())
+                        # The clamp prevents an overflow for exceptionally unlikely responses.
+                        ppl = float(np.exp(min(-mean_logprob, 80.0)))
+                    response_ppl_lst[n_sample].append(ppl)
+                    response_mean_logprob_lst[n_sample].append(mean_logprob)
+                    response_length_lst[n_sample].append(valid_len)
 
                 if analysis_enabled:
                     stats_item = policy_stats[i]
@@ -198,6 +226,12 @@ def main_task(config):
 
     # add to the data frame
     dataset["responses"] = output_lst
+    if compute_response_ppl:
+        dataset["response_ppls"] = np.transpose(np.array(response_ppl_lst, dtype=object), axes=(1, 0)).tolist()
+        dataset["response_mean_logprobs"] = np.transpose(
+            np.array(response_mean_logprob_lst, dtype=object), axes=(1, 0)
+        ).tolist()
+        dataset["response_lengths"] = np.transpose(np.array(response_length_lst, dtype=object), axes=(1, 0)).tolist()
     if analysis_enabled:
         dataset["chosen_logprobs"] = np.transpose(np.array(chosen_logprob_lst, dtype=object), axes=(1, 0)).tolist()
         dataset["topk_ids"] = np.transpose(np.array(topk_ids_lst, dtype=object), axes=(1, 0)).tolist()
