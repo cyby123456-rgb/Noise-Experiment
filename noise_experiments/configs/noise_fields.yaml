@@ -1,0 +1,22 @@
+# Reference-only Hydra overrides for hidden-state noise in VERL.
+# Apply these through the launchers; this file is not a standalone trainer config.
+
+trainer:
+  train_hidden_noise:
+    std: 0.0                 # absolute std; set >0 to enable training noise
+    layer_idx: null          # decoder layer index, or null for default
+    all_layers: false
+    base_seed: 0
+    apply_mode: rollout_only # rollout_only | update_only | all
+    decay:
+      steps: null
+      min_std: 0.0
+  validation_noise:
+    std: 0.0                 # whole-rollout validation/generation noise
+    layer_idx: null
+    all_layers: false
+    layer_fraction: null
+    layer_seed: null
+    decay:
+      steps: null
+      min_std: 0.0
