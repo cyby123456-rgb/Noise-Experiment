@@ -19,13 +19,17 @@ The input is a parquet file that contains N generated sequences and (optional) t
 
 from collections import defaultdict
 from math import comb
+from pathlib import Path
 
 import multiprocessing as mp
+import os
 import queue
 
 import hydra
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import ray
 from tqdm import tqdm
 
@@ -255,8 +259,7 @@ def log_wandb_per_response_ppl(logger, dataset, config):
 
     wandb.log({"eval/per_response_ppl": wandb.Table(columns=columns, data=rows)}, step=0)
 
-@ray.remote
-def process_item(reward_fn, data_source, response_lst, reward_data, extra_info):
+def process_item(item_index, reward_fn, data_source, response_lst, reward_data, extra_info):
     ground_truth = reward_data["ground_truth"]
     rubric_scores = defaultdict(list)
     rubric_na_counts = defaultdict(int)
@@ -270,7 +273,6 @@ def process_item(reward_fn, data_source, response_lst, reward_data, extra_info):
             ]
         else:
             score_lst = [compute_score_fn(solution_str=r, ground_truth=ground_truth) for r in response_lst]
-        print(f"score_lst: '{score_lst}'")
     else:
         results = [
             reward_fn(
@@ -311,13 +313,94 @@ def process_item(reward_fn, data_source, response_lst, reward_data, extra_info):
     for name, total in rubric_total_counts.items():
         if total:
             rubric_means[f"{name}/na_rate"] = float(rubric_na_counts[name] / total)
-    return data_source, np.mean(score_lst), passk_lst, avg32, avg4, rubric_means
+    score_lst = [float(score) for score in score_lst]
+    return item_index, data_source, np.mean(score_lst), passk_lst, avg32, avg4, rubric_means, score_lst
+
+
+# Ray is only an execution backend. Both execution modes call this exact same
+# function, so verifier behavior and per-response scores stay identical.
+process_item_remote = ray.remote(process_item)
+
+
+def write_response_scores(dataset, response_scores, config, source_path) -> None:
+    output_path_value = config.data.get("output_path")
+    if not output_path_value:
+        return
+
+    response_scores_key = str(config.data.get("response_scores_key", "response_scores"))
+    if len(response_scores) != len(dataset):
+        raise RuntimeError(
+            "Evaluated response-score row count does not match the dataset: "
+            f"scores={len(response_scores)}, rows={len(dataset)}."
+        )
+    for row_index, (scores, responses) in enumerate(zip(response_scores, dataset[config.data.response_key], strict=True)):
+        if scores is None:
+            raise RuntimeError(f"Missing response scores for dataset row {row_index}.")
+        if len(scores) != len(responses):
+            raise RuntimeError(
+                "Response scores are not aligned with generated responses: "
+                f"row={row_index}, scores={len(scores)}, responses={len(responses)}."
+            )
+
+    output_path = Path(str(output_path_value)).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
+    try:
+        source_file = pq.ParquetFile(source_path)
+        score_array = pa.array(response_scores, type=pa.list_(pa.float64()))
+        existing_index = source_file.schema_arrow.get_field_index(response_scores_key)
+        if existing_index >= 0:
+            output_schema = source_file.schema_arrow.set(
+                existing_index,
+                pa.field(response_scores_key, score_array.type),
+            )
+        else:
+            output_schema = source_file.schema_arrow.append(pa.field(response_scores_key, score_array.type))
+
+        row_offset = 0
+        with pq.ParquetWriter(temporary_path, output_schema) as writer:
+            for record_batch in source_file.iter_batches(batch_size=64):
+                batch_table = pa.Table.from_batches([record_batch])
+                batch_scores = score_array.slice(row_offset, record_batch.num_rows)
+                if existing_index >= 0:
+                    batch_table = batch_table.set_column(existing_index, response_scores_key, batch_scores)
+                else:
+                    batch_table = batch_table.append_column(response_scores_key, batch_scores)
+                writer.write_table(batch_table)
+                row_offset += record_batch.num_rows
+        if row_offset != len(response_scores):
+            raise RuntimeError(
+                "Parquet row count changed while writing response scores: "
+                f"wrote={row_offset}, scores={len(response_scores)}."
+            )
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    print(f"Saved per-response verifier scores to {output_path} column={response_scores_key}")
 
 
 @hydra.main(config_path="config", config_name="evaluation", version_base=None)
 def main(config):
     local_path = copy_to_local(config.data.path)
-    dataset = pd.read_parquet(local_path)
+    parquet_columns = set(pq.ParquetFile(local_path).schema_arrow.names)
+    required_columns = {
+        config.data.response_key,
+        config.data.data_source_key,
+        config.data.reward_model_key,
+    }
+    missing_columns = required_columns - parquet_columns
+    if missing_columns:
+        raise ValueError(f"Evaluation parquet is missing required columns: {sorted(missing_columns)}")
+    optional_columns = {
+        "extra_info",
+        "prompt",
+        "response_ppls",
+        "response_mean_logprobs",
+        "response_lengths",
+    }
+    selected_columns = list(required_columns | (optional_columns & parquet_columns))
+    dataset = pd.read_parquet(local_path, columns=selected_columns)
     responses = dataset[config.data.response_key]
     data_sources = dataset[config.data.data_source_key]
     reward_model_data = dataset[config.data.reward_model_key]
@@ -326,9 +409,12 @@ def main(config):
 
     total = len(dataset)
 
-    # Initialize Ray
-    if not ray.is_initialized():
-        ray.init(num_cpus=config.ray_init.num_cpus)
+    use_ray = bool(config.ray_init.get("use_ray", True))
+    if use_ray and not ray.is_initialized():
+        ray.init(
+            num_cpus=config.ray_init.num_cpus,
+            include_dashboard=bool(config.ray_init.get("include_dashboard", True)),
+        )
 
     # evaluate test_score based on data source
     data_source_reward = defaultdict(list)
@@ -336,33 +422,48 @@ def main(config):
     data_source_avg32 = defaultdict(list)
     data_source_avg4 = defaultdict(list)
     data_source_rubric = defaultdict(lambda: defaultdict(list))
+    response_scores = [None] * total
     compute_score = get_custom_reward_fn(config)
 
-    # Create remote tasks
-    remote_tasks = [
-        process_item.remote(
-            compute_score,
-            data_sources[i],
-            responses[i],
-            reward_model_data[i],
-            _with_memory_context(extra_infos[i], prompts[i]),
-        )
-        for i in range(total)
-    ]
+    def record_result(result):
+        item_index, data_source, score, passk_lst, avg32, avg4, rubric_means, score_lst = result
+        response_scores[item_index] = score_lst
+        data_source_reward[data_source].append(score)
+        data_source_passk[data_source].append(passk_lst)
+        data_source_avg32[data_source].append(avg32)
+        data_source_avg4[data_source].append(avg4)
+        for name, score_value in rubric_means.items():
+            data_source_rubric[data_source][name].append(score_value)
 
-    # Process results as they come in
     with tqdm(total=total) as pbar:
-        while len(remote_tasks) > 0:
-            # Use ray.wait to get completed tasks
-            done_ids, remote_tasks = ray.wait(remote_tasks)
-            for result_id in done_ids:
-                data_source, score, passk_lst, avg32, avg4, rubric_means = ray.get(result_id)
-                data_source_reward[data_source].append(score)
-                data_source_passk[data_source].append(passk_lst)
-                data_source_avg32[data_source].append(avg32)
-                data_source_avg4[data_source].append(avg4)
-                for name, score_value in rubric_means.items():
-                    data_source_rubric[data_source][name].append(score_value)
+        if use_ray:
+            remote_tasks = [
+                process_item_remote.remote(
+                    i,
+                    compute_score,
+                    data_sources[i],
+                    responses[i],
+                    reward_model_data[i],
+                    _with_memory_context(extra_infos[i], prompts[i]),
+                )
+                for i in range(total)
+            ]
+            while remote_tasks:
+                done_ids, remote_tasks = ray.wait(remote_tasks)
+                for result_id in done_ids:
+                    record_result(ray.get(result_id))
+                    pbar.update(1)
+        else:
+            for i in range(total):
+                result = process_item(
+                    i,
+                    compute_score,
+                    data_sources[i],
+                    responses[i],
+                    reward_model_data[i],
+                    _with_memory_context(extra_infos[i], prompts[i]),
+                )
+                record_result(result)
                 pbar.update(1)
 
     metric_dict = {}
@@ -402,6 +503,7 @@ def main(config):
 
     logger = log_metrics_if_configured(config, metric_dict)
     log_wandb_per_response_ppl(logger, dataset, config)
+    write_response_scores(dataset, response_scores, config, local_path)
     print(metric_dict)
 
 

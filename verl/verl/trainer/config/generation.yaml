@@ -28,6 +28,13 @@ data:
 analysis:
   enable: false
   top_k: 5
+  hidden_states:
+    enable: false
+    # Decoder layers to store from the actual vLLM forward.
+    layers: []
+    # 0 = state used to predict the first response token; k > 0 is the
+    # state after response token k during decode.
+    response_positions: []
 
 model:
   path: ~/models/Qwen2-7B-Instruct

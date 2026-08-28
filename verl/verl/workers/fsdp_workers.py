@@ -636,7 +636,32 @@ class ActorRolloutRefWorker(Worker):
 
             rollout_model = self._get_rollout_model_for_hidden_noise()
             if is_validate and validation_noise_cfg:
-                with self._apply_validation_noise_if_needed(validation_noise_cfg, is_validate):
+                runtime_noise_cfg = dict(validation_noise_cfg)
+                rollout_sample_index = prompts.meta_info.get("rollout_sample_index")
+                generation_row_indices = prompts.non_tensor_batch.get("generation_row_index")
+                layer_seed = runtime_noise_cfg.get("layer_seed")
+                if (
+                    layer_seed not in (None, "null")
+                    and rollout_sample_index is not None
+                    and generation_row_indices is not None
+                ):
+                    # The hook is installed afresh for each generate call.  If
+                    # it were given layer_seed directly, its RNG counter would
+                    # restart and replay the same Gaussian realization for all
+                    # 32 sampled rollouts.  Derive a deterministic call seed
+                    # while leaving layer_seed itself unchanged (it may also be
+                    # used to choose layers when layer_fraction is configured).
+                    row_key = ",".join(str(int(row)) for row in generation_row_indices)
+                    runtime_noise_cfg["_noise_realization_seed"] = self._derive_hidden_noise_seed(
+                        {
+                            "seed": (
+                                f"{layer_seed}::rows={row_key}::"
+                                f"rollout={int(rollout_sample_index)}"
+                            )
+                        }
+                    )
+
+                with self._apply_validation_noise_if_needed(runtime_noise_cfg, is_validate):
                     if self.config.rollout.name == "sglang_async":
                         from verl.workers.rollout.sglang_rollout import AsyncSGLangRollout
                         if isinstance(self.rollout, AsyncSGLangRollout) and hasattr(self.rollout, "_tool_schemas") and len(self.rollout._tool_schemas) > 0:
@@ -722,7 +747,14 @@ class ActorRolloutRefWorker(Worker):
             except Exception:
                 pass  # 回退到已有的 layer_idx
 
-        seed = self._derive_hidden_noise_seed({"seed": layer_seed})
+        seed = self._derive_hidden_noise_seed(
+            {
+                "seed": noise_cfg.get(
+                    "_noise_realization_seed",
+                    layer_seed,
+                )
+            }
+        )
         handles = register_hidden_state_noise(
             model=model,
             std=std_eff,

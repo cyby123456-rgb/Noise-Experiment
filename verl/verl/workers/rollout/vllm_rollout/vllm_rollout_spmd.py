@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import hashlib
 import logging
 import os
 from contextlib import contextmanager
@@ -44,6 +45,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
+from verl.models.transformers.vllm_hidden_capture_084 import begin_capture, end_capture
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -72,6 +74,14 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return value.repeat_interleave(repeats, dim=0)
     else:
         return np.repeat(value, repeats, axis=0)
+
+
+def _derive_request_seed(base_seed: int, row_index: int, rollout_sample_index: int) -> int:
+    """Return a stable seed for one dataset row and one sampled rollout."""
+    payload = f"{int(base_seed)}:{int(row_index)}:{int(rollout_sample_index)}".encode("ascii")
+    # vLLM accepts non-negative integer seeds.  Sixty-three bits avoid signed
+    # integer boundary issues while making accidental collisions negligible.
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big") & ((1 << 63) - 1)
 
 
 class vLLMRollout(BaseRollout):
@@ -257,6 +267,9 @@ class vLLMRollout(BaseRollout):
         is_validate = prompts.meta_info.get("validate", False)
         return_rollout_log_probs = bool(prompts.meta_info.get("return_rollout_log_probs", False))
         return_rollout_policy_stats = bool(prompts.meta_info.get("return_rollout_policy_stats", False))
+        return_rollout_hidden_states = bool(prompts.meta_info.get("return_rollout_hidden_states", False))
+        hidden_state_layers = prompts.meta_info.get("hidden_state_layers", [])
+        hidden_state_positions = prompts.meta_info.get("hidden_state_response_positions", [])
         rollout_policy_top_k = max(1, int(prompts.meta_info.get("analysis_top_k", 5)))
         need_rollout_log_probs = return_rollout_log_probs or return_rollout_policy_stats
         if not do_sample:
@@ -292,13 +305,75 @@ class vLLMRollout(BaseRollout):
                 lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")] * batch_size
 
         # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
+        if return_rollout_hidden_states:
+            import vllm
+
+            installed_vllm_version = str(getattr(vllm, "__version__", "unknown"))
+            if installed_vllm_version != "0.8.4":
+                raise RuntimeError(
+                    "Runtime hidden-state capture is implemented only for vLLM 0.8.4; "
+                    f"found {installed_vllm_version}."
+                )
+            if not self.config.enforce_eager:
+                raise RuntimeError("Runtime hidden-state capture requires rollout.enforce_eager=true")
+            if not hidden_state_layers or not hidden_state_positions:
+                raise ValueError("hidden_state_layers and hidden_state_response_positions are required")
+            model_executor = self.inference_engine.llm_engine.model_executor
+            driver_worker_wrapper = getattr(model_executor, "driver_worker", None)
+            actual_worker = getattr(driver_worker_wrapper, "worker", None)
+            model_runner = getattr(actual_worker, "model_runner", None)
+            if model_runner is None:
+                raise RuntimeError(
+                    "Cannot locate the vLLM 0.8.4 V0 model runner through "
+                    "LLM.llm_engine.model_executor.driver_worker.worker.model_runner. "
+                    f"executor={type(model_executor).__name__}, "
+                    f"driver_wrapper={type(driver_worker_wrapper).__name__}, "
+                    f"worker={type(actual_worker).__name__}."
+                )
+            begin_capture(
+                model_runner,
+                layers=[int(layer) for layer in hidden_state_layers],
+                response_positions=[int(position) for position in hidden_state_positions],
             )
+        else:
+            model_runner = None
+
+        with self.update_sampling_params(**kwargs):
+            request_sampling_params = self.sampling_params
+            base_seed = getattr(self.sampling_params, "seed", None)
+            rollout_sample_index = prompts.meta_info.get("rollout_sample_index")
+            generation_row_indices = non_tensor_batch.get("generation_row_index")
+            if do_sample and base_seed is not None and rollout_sample_index is not None:
+                if generation_row_indices is None:
+                    raise RuntimeError(
+                        "rollout_sample_index was provided without generation_row_index; "
+                        "cannot construct independent reproducible sampling seeds."
+                    )
+                if len(generation_row_indices) != batch_size:
+                    raise RuntimeError(
+                        "generation_row_index count does not match the rollout batch size: "
+                        f"{len(generation_row_indices)} vs {batch_size}."
+                    )
+
+                request_sampling_params = []
+                for row_index in generation_row_indices:
+                    params = self.sampling_params.clone()
+                    params.seed = _derive_request_seed(base_seed, row_index, rollout_sample_index)
+                    request_sampling_params.append(params)
+
+            try:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=request_sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
+            finally:
+                if return_rollout_hidden_states:
+                    request_ids = [str(output.request_id) for output in outputs] if "outputs" in locals() else []
+                    if not request_ids:
+                        raise RuntimeError("vLLM generation failed before hidden states could be collected")
+                    rollout_hidden_states, rollout_hidden_state_present = end_capture(model_runner, request_ids)
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -407,6 +482,14 @@ class vLLMRollout(BaseRollout):
             batch["rollout_topk_ids"] = rollout_topk_ids
             batch["rollout_topk_log_probs"] = rollout_topk_log_probs
             batch["rollout_topk_probs"] = torch.exp(rollout_topk_log_probs)
+        if return_rollout_hidden_states:
+            if rollout_hidden_states.shape[0] != batch_size:
+                raise RuntimeError(
+                    "Hidden-state request count does not match generated response count: "
+                    f"{rollout_hidden_states.shape[0]} vs {batch_size}"
+                )
+            batch["rollout_hidden_states"] = rollout_hidden_states.to(idx.device)
+            batch["rollout_hidden_state_present"] = rollout_hidden_state_present.to(idx.device)
 
         # free vllm cache engine
         if (

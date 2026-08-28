@@ -49,7 +49,13 @@ def run_generation(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}},
+            runtime_env={
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "VLLM_USE_V1": os.environ.get("VLLM_USE_V1", "0"),
+                }
+            },
             num_cpus=config.ray_init.num_cpus,
         )
         # ray.init(runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
@@ -100,6 +106,17 @@ def main_task(config):
     output_lst = [[] for _ in range(config.data.n_samples)]
     compute_response_ppl = bool(config.data.get("compute_response_ppl", False))
     analysis_enabled = bool(config.analysis.get("enable", False))
+    hidden_state_cfg = OmegaConf.select(config, "analysis.hidden_states")
+    hidden_state_enabled = bool(hidden_state_cfg and hidden_state_cfg.get("enable", False))
+    hidden_state_layers = [int(layer) for layer in hidden_state_cfg.get("layers", [])] if hidden_state_enabled else []
+    hidden_state_positions = [int(position) for position in hidden_state_cfg.get("response_positions", [])] if hidden_state_enabled else []
+    if hidden_state_enabled:
+        if config.rollout.name != "vllm" or config.rollout.mode != "sync":
+            raise ValueError("Runtime hidden-state collection requires synchronous vLLM rollout.")
+        if not config.rollout.enforce_eager:
+            raise ValueError("Runtime hidden-state collection requires rollout.enforce_eager=true.")
+        if not hidden_state_layers or not hidden_state_positions:
+            raise ValueError("analysis.hidden_states.layers and response_positions must be non-empty.")
     use_rollout_policy_stats = analysis_enabled and validation_noise_cfg is not None
     if compute_response_ppl and (config.rollout.name != "vllm" or config.rollout.mode != "sync"):
         raise ValueError("data.compute_response_ppl requires synchronous vLLM rollout.")
@@ -115,6 +132,8 @@ def main_task(config):
     response_ppl_lst = [[] for _ in range(config.data.n_samples)] if compute_response_ppl else None
     response_mean_logprob_lst = [[] for _ in range(config.data.n_samples)] if compute_response_ppl else None
     response_length_lst = [[] for _ in range(config.data.n_samples)] if compute_response_ppl else None
+    hidden_state_lst = [[] for _ in range(config.data.n_samples)] if hidden_state_enabled else None
+    hidden_state_present_lst = [[] for _ in range(config.data.n_samples)] if hidden_state_enabled else None
 
     for batch_idx in range(num_batch):
         print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
@@ -135,7 +154,18 @@ def main_task(config):
         position_ids = compute_position_id_with_mask(attention_mask)
         batch_dict = {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids}
 
-        data = DataProto.from_dict(batch_dict)
+        # Keep a stable dataset-row identifier with every prompt.  The vLLM
+        # rollout uses it together with the rollout index to derive a distinct
+        # request seed for each (question, rollout) pair.  Padding and data-
+        # parallel sharding preserve non-tensor batch fields, so the identifier
+        # remains aligned with the prompt seen by each worker.
+        batch_start = batch_idx * config_batch_size
+        batch_end = batch_start + len(batch_chat_lst)
+        generation_row_indices = np.arange(batch_start, batch_end, dtype=np.int64)
+        data = DataProto.from_dict(
+            batch_dict,
+            non_tensors={"generation_row_index": generation_row_indices},
+        )
 
         data.meta_info = {
             "validate": True,
@@ -153,12 +183,23 @@ def main_task(config):
             data.meta_info["analysis_top_k"] = int(config.analysis.top_k)
         elif compute_response_ppl:
             data.meta_info["return_rollout_log_probs"] = True
+        if hidden_state_enabled:
+            data.meta_info["return_rollout_hidden_states"] = True
+            data.meta_info["hidden_state_layers"] = hidden_state_layers
+            data.meta_info["hidden_state_response_positions"] = hidden_state_positions
 
         data_padded, pad_size = pad_dataproto_to_divisor(data, wg.world_size)
 
         # START TO GENERATE FOR n_samples TIMES
         print(f"[{batch_idx + 1}/{num_batch}] Start to generate.")
         for n_sample in range(config.data.n_samples):
+            if config.data.n_samples > 1:
+                # This metadata is intentionally zero-based.  Clean and noisy
+                # runs with the same rollout.seed therefore use exactly the
+                # same sampling seed for the same question and rollout index.
+                # Single-response generation deliberately keeps the original
+                # vLLM seed semantics for backward compatibility.
+                data_padded.meta_info["rollout_sample_index"] = int(n_sample)
             output_padded = wg.generate_sequences(data_padded)
             output = unpad_dataproto(output_padded, pad_size=pad_size)
 
@@ -202,6 +243,10 @@ def main_task(config):
                     response_mean_logprob_lst[n_sample].append(mean_logprob)
                     response_length_lst[n_sample].append(valid_len)
 
+                if hidden_state_enabled:
+                    hidden_state_lst[n_sample].append(data_item.batch["rollout_hidden_states"].tolist())
+                    hidden_state_present_lst[n_sample].append(data_item.batch["rollout_hidden_state_present"].tolist())
+
                 if analysis_enabled:
                     stats_item = policy_stats[i]
                     valid_len = int(valid_response_length.item()) if hasattr(valid_response_length, "item") else int(valid_response_length)
@@ -232,6 +277,34 @@ def main_task(config):
             np.array(response_mean_logprob_lst, dtype=object), axes=(1, 0)
         ).tolist()
         dataset["response_lengths"] = np.transpose(np.array(response_length_lst, dtype=object), axes=(1, 0)).tolist()
+    if hidden_state_enabled:
+        expected_rows = len(dataset)
+        for sample_index, sample_states in enumerate(hidden_state_lst):
+            if len(sample_states) != expected_rows:
+                raise RuntimeError(
+                    "Hidden-state row count does not match the input dataset: "
+                    f"sample={sample_index}, states={len(sample_states)}, expected={expected_rows}."
+                )
+        for sample_index, sample_present in enumerate(hidden_state_present_lst):
+            if len(sample_present) != expected_rows:
+                raise RuntimeError(
+                    "Hidden-state presence row count does not match the input dataset: "
+                    f"sample={sample_index}, masks={len(sample_present)}, expected={expected_rows}."
+                )
+
+        # hidden_state_lst is [sample][row][layer][position][hidden].
+        # Reorder only the first two axes without asking NumPy to transpose
+        # the nested layer/position/hidden dimensions.
+        dataset["rollout_hidden_states"] = [
+            [hidden_state_lst[sample_index][row_index] for sample_index in range(config.data.n_samples)]
+            for row_index in range(expected_rows)
+        ]
+        dataset["rollout_hidden_state_present"] = [
+            [hidden_state_present_lst[sample_index][row_index] for sample_index in range(config.data.n_samples)]
+            for row_index in range(expected_rows)
+        ]
+        dataset["rollout_hidden_state_layers"] = [hidden_state_layers] * len(dataset)
+        dataset["rollout_hidden_state_response_positions"] = [hidden_state_positions] * len(dataset)
     if analysis_enabled:
         dataset["chosen_logprobs"] = np.transpose(np.array(chosen_logprob_lst, dtype=object), axes=(1, 0)).tolist()
         dataset["topk_ids"] = np.transpose(np.array(topk_ids_lst, dtype=object), axes=(1, 0)).tolist()

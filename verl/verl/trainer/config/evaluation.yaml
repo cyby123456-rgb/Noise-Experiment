@@ -1,7 +1,11 @@
 data:
   path: /tmp/math_Qwen2-7B-Instruct.parquet
+  # When set, main_eval writes every rollout's raw verifier score to this
+  # parquet under response_scores_key. It may equal data.path.
+  output_path: null
   prompt_key: prompt
   response_key: responses
+  response_scores_key: response_scores
   data_source_key: data_source
   reward_model_key: reward_model
 
@@ -17,4 +21,8 @@ tracking:
   log_per_response_ppl_include_text: false
 
 ray_init:
+  # false runs the exact same scorer in the main process without starting Ray.
+  use_ray: true
+  # The dashboard is unnecessary for offline scoring and probes nvidia-smi.
+  include_dashboard: false
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
