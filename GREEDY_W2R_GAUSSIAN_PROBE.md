@@ -72,9 +72,9 @@ NUM_RESPONSE_POSITIONS=10
 
 ## 为什么需要 clean replay
 
-得到完整错误回答以后，脚本会在不加噪声的情况下重放到位置 \(t\)，再继续 greedy 生成。
+得到完整错误回答以后，脚本取它的固定前缀 \(r_1,\ldots,r_t\)，在不加噪声的情况下重放该前缀，再继续 greedy 生成。由于最初的整条回答使用逐 token KV-cache decode，而固定前缀 replay 使用长 prefill，二者在 GPU 上可能因为 batch shape 和浮点计算顺序不同而产生不同的后缀。因此不能把“必须逐 token 等于最初整条回答”作为有效性条件。
 
-重放得到的 token 序列必须和原始 clean greedy 回答完全相同。若不同，脚本立即报错，不会采集 noisy 数据。这保证后续实验确实从同一个回答状态开始。
+脚本改用该位置的 matched zero-noise replay 作为位置级 clean baseline。重复 replay 必须产生完全相同的 token 和 hidden state，而且这个 baseline 必须仍然错误；如果已经正确，该位置会被跳过。随后 32 条 noisy rollout 与位置级 clean baseline 使用完全相同的 prefix、batch、hook、greedy 参数和 continuation budget，唯一差异是注入的 \(\epsilon\)。因此 W2R 定义为“位置级 clean baseline 错误，noisy continuation 正确”。最初的完整 greedy 回答及其分数仍会单独保存，用于记录位置和前缀的来源。
 
 ## Seed 的含义
 
@@ -150,16 +150,18 @@ max_pre_noise_hidden_vs_clean_abs_diff
 每个“题目 × response 位置”保存一个 `.pt` 文件，主要字段包括：
 
 - `prompt_token_ids`；
-- `clean_response_token_ids`；
+- `clean_response_token_ids`：最初完整 greedy 错误回答的 token；
 - `fixed_response_prefix_token_ids`；
+- `position_clean_response_token_ids`：该位置 matched zero-noise replay 的完整回答；
 - `clean_hidden_state`：加噪前的 \(h_t\)；
 - `standard_normal_noise`：由 seed 决定的 FP32 (z_s\sim\mathcal N(0,I))；
 - `sampled_noise`：经过 RMS 或 absolute 缩放后的目标 FP32 Gaussian noise；
 - `applied_noise`：考虑 bf16/fp16 舍入后实际作用的噪声；
 - `clean_final_hidden_state`：\(h_t\) 不加噪时进入 LM head 前的状态；
 - `noisy_final_hidden_state`：\(h_t+\epsilon_s\) 经过 suffix decoder 后进入 LM head 前的状态；
-- `baseline_response`、`noisy_responses`；
-- `baseline_score`、`noisy_scores`、`is_w2r`；
+- `original_greedy_response`、`original_greedy_score`；
+- `baseline_response`、`baseline_score`：位置级 clean replay 及其错误分数；
+- `noisy_responses`、`noisy_scores`、`is_w2r`；
 - `zero_noise_control`：control 数量、token 一致性和零翻转率；
 - `response_position`、layer、seed 和一致性诊断。
 

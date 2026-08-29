@@ -15,7 +15,9 @@ together without duplicating VERL's framework implementation.
 - `probe/run_greedy_wrong_gaussian_probe.sh`: generate one complete greedy
   wrong answer, select uniform response positions, and at each position replay
   the clean prefix and inject one Gaussian vector only at that token. A matched
-  zero-noise placebo group must reproduce clean tokens and states exactly.
+  zero-noise group defines the position-level clean baseline and must reproduce
+  its tokens and states exactly; positions whose replay is already correct are
+  skipped rather than counted as W2R.
 - `analysis/run_exact_difficulty_summary.sh`: clean-32-rollout difficulty
   analysis of paired W->R / R->W transitions.
 - `analysis/run_hidden_state_kmeans_pipeline.sh`: batch `main_eval`, raw-space

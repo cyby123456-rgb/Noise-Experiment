@@ -34,7 +34,15 @@ from verl.models.transformers.noise_injection import _get_decoder_layers
 from verl.trainer.main_ppo import _select_rm_score_fn
 
 
-FORMAT_VERSION = "greedy-wrong-gaussian-probe-v5"
+FORMAT_VERSION = "greedy-wrong-gaussian-probe-v6"
+
+
+class PositionCleanReplayCorrect(Exception):
+    """Skip a position whose matched zero-noise replay is already correct."""
+
+    def __init__(self, score: float) -> None:
+        super().__init__(f"position clean replay is correct (score={score})")
+        self.score = float(score)
 
 
 def parse_args() -> argparse.Namespace:
@@ -412,8 +420,8 @@ def collect_one_response_position(
     input_rollout_filter_source: str | None,
     prompt_token_ids: list[int],
     clean_response_token_ids: list[int],
-    baseline_response: str,
-    baseline_score: float,
+    original_greedy_response: str,
+    original_greedy_score: float,
     response_position: int,
     layer_idx: int,
     hidden_size: int,
@@ -452,11 +460,21 @@ def collect_one_response_position(
         fixed_response_prefix_ids + continuation
         for continuation in replay_continuation_batches
     ]
-    if any(tokens != clean_response_token_ids for tokens in replay_response_token_batches):
+    position_clean_response_token_ids = replay_response_token_batches[0]
+    if any(tokens != position_clean_response_token_ids for tokens in replay_response_token_batches[1:]):
         raise RuntimeError(
-            f"Clean prefix replay did not reproduce the original greedy answer at row {row_index}, "
+            f"Repeated zero-noise prefix replays produced different token sequences at row {row_index}, "
+            f"response_position={response_position}; the position has no stable clean reference."
+        )
+    position_clean_response = decode_response(tokenizer, position_clean_response_token_ids)
+    position_clean_score = score_response(record, position_clean_response)
+    if not math.isfinite(position_clean_score):
+        raise RuntimeError(
+            f"Position clean replay produced a non-finite score at row {row_index}, "
             f"response_position={response_position}."
         )
+    if position_clean_score > 0:
+        raise PositionCleanReplayCorrect(position_clean_score)
 
     clean_hidden_batch = clean_capture["clean_hidden_state_batch"]
     clean_final_batch = clean_capture["clean_final_hidden_state_batch"]
@@ -530,9 +548,9 @@ def collect_one_response_position(
             max_difference(control_final, clean_final_hidden_state),
         )
         for continuation in control_continuations[:valid_count]:
-            if fixed_response_prefix_ids + continuation != clean_response_token_ids:
+            if fixed_response_prefix_ids + continuation != position_clean_response_token_ids:
                 raise RuntimeError(
-                    f"Zero-noise placebo changed the greedy answer at row {row_index}, "
+                    f"Zero-noise placebo changed the position-level clean replay at row {row_index}, "
                     f"position={response_position}."
                 )
             zero_noise_control_trials += 1
@@ -692,10 +710,13 @@ def collect_one_response_position(
         "prompt_token_ids": torch.tensor(prompt_token_ids, dtype=torch.long),
         "clean_response_token_ids": torch.tensor(clean_response_token_ids, dtype=torch.long),
         "fixed_response_prefix_token_ids": torch.tensor(fixed_response_prefix_ids, dtype=torch.long),
+        "position_clean_response_token_ids": torch.tensor(position_clean_response_token_ids, dtype=torch.long),
         "clean_hidden_state": clean_hidden_state,
         "clean_final_hidden_state": clean_final_hidden_state,
-        "baseline_response": baseline_response,
-        "baseline_score": float(baseline_score),
+        "original_greedy_response": original_greedy_response,
+        "original_greedy_score": float(original_greedy_score),
+        "baseline_response": position_clean_response,
+        "baseline_score": float(position_clean_score),
         "zero_noise_control": {
             "trials": zero_noise_control_trials,
             "all_token_sequences_match_clean": True,
@@ -732,7 +753,11 @@ def collect_one_response_position(
         "zero_noise_control_trials": zero_noise_control_trials,
         "zero_noise_control_w2r_count": 0,
         "zero_noise_control_w2r_rate": 0.0,
-        "baseline_score": float(baseline_score),
+        "original_greedy_score": float(original_greedy_score),
+        "baseline_score": float(position_clean_score),
+        "position_clean_matches_original_greedy": (
+            position_clean_response_token_ids == clean_response_token_ids
+        ),
         "w2r_count": question_w2r,
         "w2r_rate": question_w2r / len(noise_seeds),
         "diagnostics": diagnostics,
@@ -869,26 +894,35 @@ def main() -> None:
                 if len(token_ids) + response_position > args.max_input_tokens:
                     exclusions["replay_prefix_exceeds_max_input_tokens"] += 1
                     continue
-                shard, manifest_record, position_trials, position_w2r = collect_one_response_position(
-                    args=args,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    record=record,
-                    row_index=row_index,
-                    problem_index=problem_index,
-                    question_index=question_index,
-                    input_rollout_filter_source=input_rollout_filter_source,
-                    prompt_token_ids=token_ids,
-                    clean_response_token_ids=clean_response_token_ids,
-                    baseline_response=baseline_response,
-                    baseline_score=baseline_score,
-                    response_position=response_position,
-                    layer_idx=layer_idx,
-                    hidden_size=hidden_size,
-                    noise_seeds=noise_seeds,
-                    completed_trials_before=completed_trials,
-                )
+                try:
+                    shard, manifest_record, position_trials, position_w2r = collect_one_response_position(
+                        args=args,
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=device,
+                        record=record,
+                        row_index=row_index,
+                        problem_index=problem_index,
+                        question_index=question_index,
+                        input_rollout_filter_source=input_rollout_filter_source,
+                        prompt_token_ids=token_ids,
+                        clean_response_token_ids=clean_response_token_ids,
+                        original_greedy_response=baseline_response,
+                        original_greedy_score=baseline_score,
+                        response_position=response_position,
+                        layer_idx=layer_idx,
+                        hidden_size=hidden_size,
+                        noise_seeds=noise_seeds,
+                        completed_trials_before=completed_trials,
+                    )
+                except PositionCleanReplayCorrect as exc:
+                    exclusions["position_clean_replay_correct"] += 1
+                    print(
+                        f"[greedy-gaussian] row={row_index}, position={response_position}: "
+                        f"skipped because matched clean replay is already correct (score={exc.score})",
+                        flush=True,
+                    )
+                    continue
                 shard_name = (
                     f"question_{question_index:04d}_row_{row_index}_pos_{response_position:06d}.pt"
                 )
@@ -918,6 +952,7 @@ def main() -> None:
                     "row_index": row_index,
                     "problem_index": problem_index,
                     "clean_response_length": len(clean_response_token_ids),
+                    "original_greedy_score": float(baseline_score),
                     "selected_response_positions": response_positions,
                     "completed_response_positions": completed_positions,
                 }
