@@ -65,18 +65,25 @@ def load_test_cases(test_cases):
 
 def compute_score(completion, test_cases, continuous=False):
     solution = extract_solution(completion)
+    success = False
+    metadata_list = None
     try:
         test_cases = load_test_cases(test_cases)
 
         # Complete check on all in-out pairs first. If there is no failure, per-sample test can be skipped.
         try:
             res, metadata = apps_check_correctness(in_outs=test_cases, generation=solution, timeout=5, debug=False)
-            metadata = dict(enumerate(metadata))[0]
-            success = all(map(lambda x: x is True, res))
-            if success:
-                return success, metadata
+            metadata_list = metadata[0] if len(metadata) > 0 else {}
+            # ``all([])`` is True in Python, so require at least one actual
+            # test result before declaring a program correct.
+            success = bool(res) and all(result is True for result in res)
+            if success or not continuous:
+                return success, metadata_list
         except Exception:
-            pass
+            # Evaluation errors and global timeouts fail closed. In strict
+            # pass-all mode there is no reason to execute the cases again.
+            if not continuous:
+                return False, metadata_list
 
         test_cases_list = []
         inputs = test_cases["inputs"]

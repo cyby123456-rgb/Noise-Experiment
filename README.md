@@ -18,6 +18,14 @@ together without duplicating VERL's framework implementation.
   zero-noise group defines the position-level clean baseline and must reproduce
   its tokens and states exactly; positions whose replay is already correct are
   skipped rather than counted as W2R.
+- `probe/run_greedy_wrong_gaussian_probe_v8.py`: strict full-path v8 collector
+  that saves clean/noisy suffix-layer states, deltas, logits, responses, scores,
+  and auditable per-position manifests.
+- `probe/run_greedy_wrong_gaussian_probe_v8_code.sh`: code-dataset launcher.
+  Its default `independent` seed mode gives every `(question, position, trial)`
+  a distinct Gaussian vector while remaining exactly reproducible.
+- `scripts/data/download_prepare_apps.py`: reproducibly shuffle and prepare a
+  small APPS parquet without relying on deprecated Hugging Face dataset scripts.
 - `analysis/run_exact_difficulty_summary.sh`: clean-32-rollout difficulty
   analysis of paired W->R / R->W transitions.
 - `analysis/run_hidden_state_kmeans_pipeline.sh`: batch `main_eval`, raw-space
@@ -49,6 +57,11 @@ default. Conditional on the fixed clean state, it samples
 `epsilon = noise_std * RMS(h_t) * z`, where `z ~ N(0, I)`. Thus `noise_std=0.1`
 means a per-coordinate noise RMS of about 10% of the clean token hidden RMS.
 Use `absolute` only when reproducing an older raw-hidden-unit experiment.
+
+For code experiments, correctness means passing every executable test case.
+Run generated programs only in an isolated container. The code launcher accepts
+`apps`, `taco`, `codecontests`, `codeforces`, and `livecodebench/*` sources and
+defaults to independent directions across questions and response positions.
 
 All launchers default to the current project's `verl/` source tree.  Set
 `VERL_ROOT=/path/to/noise_experiments/verl` to run from the complete backup
