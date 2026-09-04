@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Collect strict full-path Gaussian W2R trials from greedy-wrong questions.
+"""Collect batched single-token Gaussian W2R trials on code problems.
 
-For every accepted question, the script first produces one complete batch-1
-greedy wrong answer from the original prompt.  For each selected response-token
-position, every control/noisy trial starts again from that same original prompt
-and follows the same batch-1 greedy decoding path.  The intervention hook is
-idle during prompt prefill and all earlier response-token steps; it injects one
-Gaussian vector only while processing the selected response token.  Therefore
-tokens through the selected position must match the clean baseline exactly, and
-only later tokens are allowed to diverge.
+For every accepted question, the script first produces one complete clean
+greedy answer using the same fixed batch shape as every intervention run. For
+each selected response-token position, independent Gaussian trials are split
+into GPU batches. Every batch contains one matched zero-noise row plus B noisy
+rows, all starting from the same prompt and following the same greedy path
+through the intervention token. The hook injects a distinct vector into each
+noisy row only while that token is processed. Generated programs are scored
+with strict pass-all-tests correctness.
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ from verl.trainer.main_ppo import _select_rm_score_fn
 
 
 FORMAT_VERSION = (
-    "greedy-wrong-gaussian-probe-v8-strict-full-path-seed-modes-"
-    "suffix-traces-logits-strict-code"
+    "greedy-wrong-gaussian-probe-v9-code-parallel-fixed-shape-clean-matched-zero-control-"
+    "suffix-traces-logits-strict-pass-all"
 )
 
 CODE_ALIASES = {
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--noise-seed-mode",
         choices=("paired", "independent"),
-        default="paired",
+        default="independent",
         help=(
             "paired reuses the same per-trial Gaussian directions across questions/positions; "
             "independent deterministically derives a distinct seed for every "
@@ -99,10 +99,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--noise-batch-size",
         type=int,
-        default=1,
+        default=8,
         help=(
-            "Strict full-path mode requires 1. Each clean/noisy trial is run from the original "
-            "prompt with batch size 1 so batching cannot alter the pre-intervention greedy path."
+            "Number of noisy trials generated together on the GPU. One additional matched "
+            "zero-noise control row is included in every batch. The number of noise seeds "
+            "must be divisible by this value so every execution uses the same batch shape."
         ),
     )
     parser.add_argument("--max-questions", type=int, default=1)
@@ -137,6 +138,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-input-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable a tokenizer chat template's thinking mode. The code launcher defaults "
+            "to --no-enable-thinking because Qwen3 thinking mode is not compatible with "
+            "the experiment's deterministic greedy decoder."
+        ),
+    )
     parser.add_argument("--log-every", type=int, default=16)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -168,7 +179,7 @@ def derive_independent_noise_seed(
 ) -> int:
     """Derive a stable, condition-specific 63-bit seed without Python hash randomization."""
     payload = (
-        f"greedy-gaussian-v8:{base_seed}:{noise_namespace}:{question_fingerprint}:"
+        f"greedy-gaussian-v9-code-parallel:{base_seed}:{noise_namespace}:{question_fingerprint}:"
         f"{layer_idx}:{response_position}:{trial_index}"
     ).encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
@@ -298,10 +309,20 @@ def score_response(record: dict[str, Any], response: str) -> float:
     return float(result)
 
 
-def prompt_ids(tokenizer, prompt: Any, max_input_tokens: int) -> list[int]:
+def prompt_ids(
+    tokenizer,
+    prompt: Any,
+    max_input_tokens: int,
+    enable_thinking: bool,
+) -> list[int]:
     prompt = as_python(prompt)
     if isinstance(prompt, list):
-        token_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+        token_ids = tokenizer.apply_chat_template(
+            prompt,
+            add_generation_prompt=True,
+            tokenize=True,
+            enable_thinking=enable_thinking,
+        )
     elif isinstance(prompt, str):
         token_ids = tokenizer(prompt, add_special_tokens=True).input_ids
     else:
@@ -394,8 +415,10 @@ def register_position_intervention(
     if response_position <= 0:
         raise ValueError("response_position must be one-based and positive")
     if sampled_noise is not None:
-        if sampled_noise.ndim != 1 or sampled_noise.dtype != torch.float32 or sampled_noise.device.type != "cpu":
-            raise ValueError("sampled_noise must be a CPU float32 vector with shape [hidden]")
+        if sampled_noise.ndim != 2 or sampled_noise.dtype != torch.float32 or sampled_noise.device.type != "cpu":
+            raise ValueError(
+                "sampled_noise must be a CPU float32 tensor with shape [batch, hidden]"
+            )
 
     layers = _get_decoder_layers(model)
     lm_head = model.get_output_embeddings()
@@ -414,39 +437,40 @@ def register_position_intervention(
             return output
 
         hidden = _layer_hidden(output)
-        if hidden.shape[0] != 1:
+        if sampled_noise is not None and hidden.shape[0] != sampled_noise.shape[0]:
             raise RuntimeError(
-                "Strict full-path intervention requires batch size 1, "
-                f"got hidden batch={hidden.shape[0]}"
+                "Noise batch does not match the model batch: "
+                f"noise={sampled_noise.shape[0]}, hidden={hidden.shape[0]}"
             )
         clean_token = hidden[:, -1, :]
-        capture["pre_noise_hidden_state"] = clean_token[0].detach().float().cpu()
+        capture["pre_noise_hidden_state"] = clean_token.detach().float().cpu()
         capture["target_forward_call_index"] = int(forward_call_index)
         waiting_for_target_lm_head = True
 
         if sampled_noise is None:
-            capture["sampled_noise"] = torch.zeros(clean_token.shape[-1], dtype=torch.float32)
-            capture["applied_noise"] = torch.zeros(clean_token.shape[-1], dtype=torch.float32)
-            capture["post_intervention_hidden_state"] = clean_token[0].detach().float().cpu()
+            zero = torch.zeros_like(clean_token, dtype=torch.float32, device="cpu")
+            capture["sampled_noise"] = zero
+            capture["applied_noise"] = zero.clone()
+            capture["post_intervention_hidden_state"] = clean_token.detach().float().cpu()
             capture["suffix_decoder_layer_hidden_states"][layer_idx] = (
-                clean_token[0].detach().float().cpu()
+                clean_token.detach().float().cpu()
             )
             return output
 
-        if clean_token.shape[-1] != sampled_noise.shape[0]:
+        if clean_token.shape != sampled_noise.shape:
             raise ValueError(
                 "Noise shape does not match target hidden state: "
                 f"noise={tuple(sampled_noise.shape)}, hidden={tuple(clean_token.shape)}"
             )
         noise_device = sampled_noise.to(device=hidden.device, dtype=torch.float32)
-        modified_token = (clean_token.float() + noise_device.unsqueeze(0)).to(dtype=hidden.dtype)
+        modified_token = (clean_token.float() + noise_device).to(dtype=hidden.dtype)
         modified = hidden.clone()
         modified[:, -1, :] = modified_token
         capture["sampled_noise"] = sampled_noise.clone()
-        capture["applied_noise"] = (modified_token.float() - clean_token.float())[0].detach().cpu()
-        capture["post_intervention_hidden_state"] = modified_token[0].detach().float().cpu()
+        capture["applied_noise"] = (modified_token.float() - clean_token.float()).detach().cpu()
+        capture["post_intervention_hidden_state"] = modified_token.detach().float().cpu()
         capture["suffix_decoder_layer_hidden_states"][layer_idx] = (
-            modified_token[0].detach().float().cpu()
+            modified_token.detach().float().cpu()
         )
         if isinstance(output, tuple):
             return (modified, *output[1:])
@@ -457,13 +481,8 @@ def register_position_intervention(
             if not waiting_for_target_lm_head:
                 return output
             hidden = _layer_hidden(output)
-            if hidden.shape[0] != 1:
-                raise RuntimeError(
-                    "Strict full-path suffix capture requires batch size 1, "
-                    f"got hidden batch={hidden.shape[0]} at decoder layer {suffix_layer_idx}"
-                )
             capture["suffix_decoder_layer_hidden_states"][suffix_layer_idx] = (
-                hidden[0, -1, :].detach().float().cpu()
+                hidden[:, -1, :].detach().float().cpu()
             )
             return output
 
@@ -474,12 +493,7 @@ def register_position_intervention(
         if not waiting_for_target_lm_head:
             return None
         hidden = _lm_head_hidden(inputs)
-        if hidden.shape[0] != 1:
-            raise RuntimeError(
-                "Strict full-path intervention requires batch size 1 at LM head, "
-                f"got batch={hidden.shape[0]}"
-            )
-        capture["final_hidden_state"] = hidden[0, -1, :].detach().float().cpu()
+        capture["final_hidden_state"] = hidden[:, -1, :].detach().float().cpu()
         waiting_for_target_lm_head = False
         waiting_for_target_logits = True
         return None
@@ -489,12 +503,7 @@ def register_position_intervention(
         if not waiting_for_target_logits:
             return output
         logits = _lm_head_logits(output)
-        if logits.shape[0] != 1:
-            raise RuntimeError(
-                "Strict full-path logit capture requires batch size 1 at LM head, "
-                f"got batch={logits.shape[0]}"
-            )
-        capture["next_token_logits"] = logits[0, -1, :].detach().float().cpu()
+        capture["next_token_logits"] = logits[:, -1, :].detach().float().cpu()
         waiting_for_target_logits = False
         return output
 
@@ -518,8 +527,16 @@ def run_full_greedy_path(
     sampled_noise: torch.Tensor | None,
     max_new_tokens: int,
     device: torch.device,
-) -> tuple[list[int], dict[str, Any]]:
-    """Run one batch-1 greedy generation from the original prompt."""
+    batch_size: int = 1,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    """Run one fixed-shape greedy batch from the original prompt."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if sampled_noise is not None and sampled_noise.shape[0] != batch_size:
+        raise ValueError(
+            f"sampled_noise batch={sampled_noise.shape[0]} does not match batch_size={batch_size}"
+        )
 
     handles, capture = register_position_intervention(
         model,
@@ -528,14 +545,14 @@ def run_full_greedy_path(
         sampled_noise=sampled_noise,
     )
     try:
-        response_token_ids = greedy_generate_batch(
+        response_token_batches = greedy_generate_batch(
             model,
             tokenizer,
             prompt_token_ids,
-            1,
+            batch_size,
             max_new_tokens,
             device,
-        )[0]
+        )
     finally:
         remove_handles(handles)
 
@@ -577,9 +594,9 @@ def run_full_greedy_path(
     capture["suffix_hidden_states"] = torch.stack(
         [layer_states[suffix_layer_idx] for suffix_layer_idx in suffix_decoder_layer_indices]
         + [capture["final_hidden_state"]],
-        dim=0,
+        dim=1,
     )
-    return response_token_ids, capture
+    return response_token_batches, capture
 
 
 def remove_handles(handles: list[Any]) -> None:
@@ -593,6 +610,28 @@ def require_capture(capture: dict[str, torch.Tensor], keys: tuple[str, ...]) -> 
         raise RuntimeError(f"Generation completed without required hook captures: {missing}")
 
 
+def generation_eos_token_ids(model, tokenizer) -> list[int]:
+    """Preserve every checkpoint-configured EOS instead of collapsing to one tokenizer ID."""
+
+    candidates = [
+        getattr(getattr(model, "generation_config", None), "eos_token_id", None),
+        getattr(getattr(model, "config", None), "eos_token_id", None),
+        getattr(tokenizer, "eos_token_id", None),
+    ]
+    resolved: list[int] = []
+    for candidate in candidates:
+        values = candidate if isinstance(candidate, (list, tuple)) else [candidate]
+        for value in values:
+            if value is None:
+                continue
+            token_id = int(value)
+            if token_id not in resolved:
+                resolved.append(token_id)
+    if not resolved:
+        raise ValueError("The model/tokenizer does not define any EOS token ID")
+    return resolved
+
+
 @torch.inference_mode()
 def greedy_generate_batch(
     model,
@@ -604,6 +643,7 @@ def greedy_generate_batch(
 ) -> list[list[int]]:
     inputs = torch.tensor([input_ids] * batch_size, device=device, dtype=torch.long)
     attention_mask = torch.ones_like(inputs)
+    eos_token_ids = generation_eos_token_ids(model, tokenizer)
     generated = model.generate(
         input_ids=inputs,
         attention_mask=attention_mask,
@@ -611,13 +651,11 @@ def greedy_generate_batch(
         num_beams=1,
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=eos_token_ids,
         use_cache=True,
     )
     sequences = generated.sequences if hasattr(generated, "sequences") else generated
-    eos_ids = tokenizer.eos_token_id
-    eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])
-    eos_ids.discard(None)
+    eos_ids = set(eos_token_ids)
     pad_id = tokenizer.pad_token_id
     completions: list[list[int]] = []
     for row in sequences:
@@ -685,7 +723,9 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=jsonable), encoding="utf-8")
 
 
-def collect_one_response_position(
+
+
+def collect_one_response_position_parallel(
     *,
     args: argparse.Namespace,
     model,
@@ -706,116 +746,98 @@ def collect_one_response_position(
     noise_seeds: list[int],
     completed_trials_before: int,
 ) -> tuple[dict[str, Any], dict[str, Any], int, int]:
-    """Collect strict W2R trials at one response position.
+    """Collect one code position with fixed-shape parallel noisy rollouts."""
 
-    Invariants:
-      1. A second clean batch-1 run from the original prompt must reproduce the
-         complete original greedy response token-for-token.
-      2. A zero-noise hook run from the original prompt must also reproduce it.
-      3. Every noisy run must have the identical clean hidden state before the
-         intervention, and its response tokens 1..p must equal the baseline.
-      4. W2R is scored only after those invariants hold.
-    """
-
-    record_question_fingerprint = question_fingerprint(record)
+    noisy_batch_size = args.noise_batch_size
+    if len(noise_seeds) % noisy_batch_size != 0:
+        raise ValueError(
+            f"Noise seed count {len(noise_seeds)} must be divisible by "
+            f"--noise-batch-size={noisy_batch_size}"
+        )
+    execution_batch_size = noisy_batch_size + 1
     fixed_response_prefix_ids = clean_response_token_ids[:response_position]
+    record_question_fingerprint = question_fingerprint(record)
 
-    # Clean state capture: same original prompt, same batch-1 greedy path, no
-    # prefix replay and no alternative baseline definition.
-    clean_regen_tokens, clean_capture = run_full_greedy_path(
+    # Establish the clean reference with exactly the same execution batch shape
+    # used by every noisy call. All rows are zero controls in this first call.
+    all_zero_noise = torch.zeros(
+        execution_batch_size,
+        hidden_size,
+        dtype=torch.float32,
+    )
+    control_token_batches, control_capture = run_full_greedy_path(
         model=model,
         tokenizer=tokenizer,
         prompt_token_ids=prompt_token_ids,
         response_position=response_position,
         layer_idx=layer_idx,
-        sampled_noise=None,
+        sampled_noise=all_zero_noise,
+        batch_size=execution_batch_size,
         max_new_tokens=args.max_new_tokens,
         device=device,
     )
-    if clean_regen_tokens != clean_response_token_ids:
+    if any(tokens != clean_response_token_ids for tokens in control_token_batches):
         raise RuntimeError(
-            f"Strict clean greedy regeneration did not reproduce the original baseline at row {row_index}, "
-            f"response_position={response_position}. No W2R data are valid for this position."
+            f"Batch-matched zero controls did not reproduce the fixed-shape clean greedy answer "
+            f"at row={row_index}, position={response_position}."
         )
 
-    clean_hidden_state = clean_capture["pre_noise_hidden_state"].clone()
-    clean_final_hidden_state = clean_capture["final_hidden_state"].clone()
-    suffix_decoder_layer_indices = list(clean_capture["suffix_decoder_layer_indices"])
-    suffix_state_labels = list(clean_capture["suffix_state_labels"])
-    clean_suffix_hidden_states = clean_capture["suffix_hidden_states"].clone()
-    clean_next_token_logits = clean_capture["next_token_logits"].clone()
-    vocab_size = int(clean_next_token_logits.shape[0])
-    if vocab_size <= 0:
-        raise RuntimeError(
-            f"Captured invalid vocabulary size at row={row_index}, position={response_position}: "
-            f"{vocab_size}"
-        )
+    suffix_decoder_layer_indices = list(control_capture["suffix_decoder_layer_indices"])
+    suffix_state_labels = list(control_capture["suffix_state_labels"])
     expected_suffix_depth = len(suffix_decoder_layer_indices) + 1
-    if clean_suffix_hidden_states.shape != (expected_suffix_depth, hidden_size):
+    vocab_size = int(control_capture["next_token_logits"].shape[-1])
+    expected_control_shapes = {
+        "pre_noise_hidden_state": (execution_batch_size, hidden_size),
+        "sampled_noise": (execution_batch_size, hidden_size),
+        "applied_noise": (execution_batch_size, hidden_size),
+        "final_hidden_state": (execution_batch_size, hidden_size),
+        "suffix_hidden_states": (
+            execution_batch_size,
+            expected_suffix_depth,
+            hidden_size,
+        ),
+        "next_token_logits": (execution_batch_size, vocab_size),
+    }
+    malformed_control = {
+        name: tuple(control_capture[name].shape)
+        for name, expected in expected_control_shapes.items()
+        if tuple(control_capture[name].shape) != expected
+    }
+    if malformed_control:
         raise RuntimeError(
-            "Clean suffix hidden-state trace has unexpected shape: "
-            f"expected={(expected_suffix_depth, hidden_size)}, "
-            f"actual={tuple(clean_suffix_hidden_states.shape)}"
+            f"Batch-matched control capture has malformed shapes at row={row_index}, "
+            f"position={response_position}: {malformed_control}"
         )
+    if control_capture["applied_noise"].abs().max().item() != 0:
+        raise RuntimeError("The all-zero control batch applied nonzero noise")
+
+    control_spreads = {
+        "pre_noise_hidden_state": max_batch_spread(control_capture["pre_noise_hidden_state"]),
+        "final_hidden_state": max_batch_spread(control_capture["final_hidden_state"]),
+        "suffix_hidden_states": max_batch_spread(control_capture["suffix_hidden_states"]),
+        "next_token_logits": max_batch_spread(control_capture["next_token_logits"]),
+    }
+    if any(value != 0 for value in control_spreads.values()):
+        raise RuntimeError(
+            f"Identical zero-control rows diverged at row={row_index}, "
+            f"position={response_position}: {control_spreads}"
+        )
+
+    clean_hidden_state = control_capture["pre_noise_hidden_state"][0].clone()
+    clean_final_hidden_state = control_capture["final_hidden_state"][0].clone()
+    clean_suffix_hidden_states = control_capture["suffix_hidden_states"][0].clone()
+    clean_next_token_logits = control_capture["next_token_logits"][0].clone()
     clean_hidden_rms = float(clean_hidden_state.square().mean().sqrt().item())
     if not math.isfinite(clean_hidden_rms) or clean_hidden_rms <= 0:
         raise RuntimeError(
-            f"Invalid clean hidden RMS at row {row_index}, position={response_position}: {clean_hidden_rms}"
+            f"Invalid clean hidden RMS at row={row_index}, "
+            f"position={response_position}: {clean_hidden_rms}"
         )
     effective_noise_std = (
         float(args.noise_std) * clean_hidden_rms
         if args.noise_scale_mode == "relative_rms"
         else float(args.noise_std)
     )
-
-    # One deterministic zero-noise placebo is sufficient in strict batch-1
-    # mode. It executes the intervention code path but must remain bit-identical
-    # in tokens and captured states.
-    zero_noise = torch.zeros(hidden_size, dtype=torch.float32)
-    zero_tokens, zero_capture = run_full_greedy_path(
-        model=model,
-        tokenizer=tokenizer,
-        prompt_token_ids=prompt_token_ids,
-        response_position=response_position,
-        layer_idx=layer_idx,
-        sampled_noise=zero_noise,
-        max_new_tokens=args.max_new_tokens,
-        device=device,
-    )
-    if zero_tokens != clean_response_token_ids:
-        raise RuntimeError(
-            f"Zero-noise full-path control changed the greedy answer at row {row_index}, "
-            f"response_position={response_position}."
-        )
-    zero_pre_diff = float((zero_capture["pre_noise_hidden_state"] - clean_hidden_state).abs().max().item())
-    zero_applied_max = float(zero_capture["applied_noise"].abs().max().item())
-    zero_final_diff = float((zero_capture["final_hidden_state"] - clean_final_hidden_state).abs().max().item())
-    zero_suffix_diff = float(
-        (zero_capture["suffix_hidden_states"] - clean_suffix_hidden_states).abs().max().item()
-    )
-    zero_logits_diff = float(
-        (zero_capture["next_token_logits"] - clean_next_token_logits).abs().max().item()
-    )
-    if (
-        zero_capture["suffix_decoder_layer_indices"] != suffix_decoder_layer_indices
-        or zero_capture["suffix_state_labels"] != suffix_state_labels
-    ):
-        raise RuntimeError(
-            f"Zero-noise suffix capture schema differs from clean at row={row_index}, "
-            f"position={response_position}."
-        )
-    if (
-        zero_pre_diff != 0
-        or zero_applied_max != 0
-        or zero_final_diff != 0
-        or zero_suffix_diff != 0
-        or zero_logits_diff != 0
-    ):
-        raise RuntimeError(
-            f"Zero-noise full-path control changed model states at row {row_index}, "
-            f"position={response_position}: pre={zero_pre_diff}, applied={zero_applied_max}, "
-            f"final={zero_final_diff}, suffix={zero_suffix_diff}, logits={zero_logits_diff}."
-        )
 
     standard_normal_noise_parts: list[torch.Tensor] = []
     sampled_noise_parts: list[torch.Tensor] = []
@@ -828,68 +850,136 @@ def collect_one_response_position(
     noisy_scores: list[float] = []
     is_w2r: list[bool] = []
     noise_hashes: list[str] = []
-    max_pre_noise_difference = 0.0
     completed_here = 0
+    max_pre_noise_difference = 0.0
+    max_zero_final_difference = 0.0
+    max_zero_suffix_difference = 0.0
+    max_zero_logits_difference = 0.0
+    max_zero_applied_abs = 0.0
+    noisy_batch_count = 0
 
-    for seed in noise_seeds:
-        standard_normal = sample_standard_normal(seed, hidden_size)
-        sampled_noise = standard_normal * effective_noise_std
-        response_token_ids, noisy_capture = run_full_greedy_path(
+    for batch_start in range(0, len(noise_seeds), noisy_batch_size):
+        batch_seeds = noise_seeds[batch_start : batch_start + noisy_batch_size]
+        standard_normal_batch = torch.stack(
+            [sample_standard_normal(seed, hidden_size) for seed in batch_seeds],
+            dim=0,
+        )
+        sampled_noise_batch = standard_normal_batch * effective_noise_std
+        execution_noise = torch.cat(
+            [torch.zeros(1, hidden_size, dtype=torch.float32), sampled_noise_batch],
+            dim=0,
+        )
+        response_token_batches, noisy_capture = run_full_greedy_path(
             model=model,
             tokenizer=tokenizer,
             prompt_token_ids=prompt_token_ids,
             response_position=response_position,
             layer_idx=layer_idx,
-            sampled_noise=sampled_noise,
+            sampled_noise=execution_noise,
+            batch_size=execution_batch_size,
             max_new_tokens=args.max_new_tokens,
             device=device,
         )
+        noisy_batch_count += 1
 
-        # Noise while processing token p can only affect token p+1 onward.
-        if len(response_token_ids) < response_position or response_token_ids[:response_position] != fixed_response_prefix_ids:
+        if noisy_capture["suffix_decoder_layer_indices"] != suffix_decoder_layer_indices:
+            raise RuntimeError("Parallel suffix decoder indices changed between batches")
+        if noisy_capture["suffix_state_labels"] != suffix_state_labels:
+            raise RuntimeError("Parallel suffix state labels changed between batches")
+        if response_token_batches[0] != clean_response_token_ids:
             raise RuntimeError(
-                f"Noisy run diverged before the intervention could causally affect generation at row {row_index}, "
-                f"position={response_position}, seed={seed}. Tokens 1..p must equal clean exactly."
+                f"The in-batch zero control changed the clean answer at row={row_index}, "
+                f"position={response_position}, batch={noisy_batch_count}."
             )
+        for local_index, response_tokens in enumerate(response_token_batches[1:]):
+            if (
+                len(response_tokens) < response_position
+                or response_tokens[:response_position] != fixed_response_prefix_ids
+            ):
+                raise RuntimeError(
+                    f"Parallel noisy row diverged before the intervention could act at "
+                    f"row={row_index}, position={response_position}, "
+                    f"seed={batch_seeds[local_index]}."
+                )
 
-        pre_diff = float((noisy_capture["pre_noise_hidden_state"] - clean_hidden_state).abs().max().item())
+        pre_diff = max_difference(
+            noisy_capture["pre_noise_hidden_state"],
+            clean_hidden_state,
+        )
         max_pre_noise_difference = max(max_pre_noise_difference, pre_diff)
         if pre_diff != 0:
             raise RuntimeError(
-                f"Noisy trial did not reach the exact same clean pre-intervention state at row {row_index}, "
-                f"position={response_position}, seed={seed}: max_diff={pre_diff}."
+                f"Parallel rows did not reach the exact batch-matched pre-noise state at "
+                f"row={row_index}, position={response_position}, max_diff={pre_diff}."
             )
-        if (
-            noisy_capture["suffix_decoder_layer_indices"] != suffix_decoder_layer_indices
-            or noisy_capture["suffix_state_labels"] != suffix_state_labels
+        if not torch.equal(noisy_capture["sampled_noise"], execution_noise):
+            raise RuntimeError("The intervention hook did not receive the requested noise matrix")
+
+        zero_applied_abs = float(noisy_capture["applied_noise"][0].abs().max().item())
+        zero_final_diff = float(
+            (noisy_capture["final_hidden_state"][0] - clean_final_hidden_state)
+            .abs()
+            .max()
+            .item()
+        )
+        zero_suffix_diff = float(
+            (noisy_capture["suffix_hidden_states"][0] - clean_suffix_hidden_states)
+            .abs()
+            .max()
+            .item()
+        )
+        zero_logits_diff = float(
+            (noisy_capture["next_token_logits"][0] - clean_next_token_logits)
+            .abs()
+            .max()
+            .item()
+        )
+        max_zero_applied_abs = max(max_zero_applied_abs, zero_applied_abs)
+        max_zero_final_difference = max(max_zero_final_difference, zero_final_diff)
+        max_zero_suffix_difference = max(max_zero_suffix_difference, zero_suffix_diff)
+        max_zero_logits_difference = max(max_zero_logits_difference, zero_logits_diff)
+        if any(
+            value != 0
+            for value in (
+                zero_applied_abs,
+                zero_final_diff,
+                zero_suffix_diff,
+                zero_logits_diff,
+            )
         ):
             raise RuntimeError(
-                f"Noisy suffix capture schema differs from clean at row={row_index}, "
-                f"position={response_position}, seed={seed}."
+                f"In-batch zero control changed model state at row={row_index}, "
+                f"position={response_position}, batch={noisy_batch_count}: "
+                f"applied={zero_applied_abs}, final={zero_final_diff}, "
+                f"suffix={zero_suffix_diff}, logits={zero_logits_diff}."
             )
 
-        response = decode_response(tokenizer, response_token_ids)
-        score = score_response(record, response)
-        flipped = bool(math.isfinite(score) and baseline_score <= 0 and score > 0)
+        for local_index, response_tokens in enumerate(response_token_batches[1:]):
+            response = decode_response(tokenizer, response_tokens)
+            score = score_response(record, response)
+            flipped = bool(math.isfinite(score) and baseline_score <= 0 and score > 0)
+            noisy_responses.append(response)
+            noisy_response_token_ids.append(response_tokens)
+            noisy_scores.append(score)
+            is_w2r.append(flipped)
+            noise_hashes.append(
+                hashlib.sha256(sampled_noise_batch[local_index].numpy().tobytes()).hexdigest()
+            )
 
-        standard_normal_noise_parts.append(standard_normal.unsqueeze(0))
-        sampled_noise_parts.append(noisy_capture["sampled_noise"].unsqueeze(0))
-        applied_noise_parts.append(noisy_capture["applied_noise"].unsqueeze(0))
-        noisy_final_parts.append(noisy_capture["final_hidden_state"].unsqueeze(0))
-        noisy_suffix_hidden_parts.append(noisy_capture["suffix_hidden_states"].unsqueeze(0))
-        noisy_next_token_logits_parts.append(noisy_capture["next_token_logits"].unsqueeze(0))
-        noisy_responses.append(response)
-        noisy_response_token_ids.append(response_token_ids)
-        noisy_scores.append(score)
-        is_w2r.append(flipped)
-        noise_hashes.append(hashlib.sha256(sampled_noise.numpy().tobytes()).hexdigest())
-
-        completed_here += 1
+        standard_normal_noise_parts.append(standard_normal_batch)
+        sampled_noise_parts.append(sampled_noise_batch)
+        applied_noise_parts.append(noisy_capture["applied_noise"][1:].clone())
+        noisy_final_parts.append(noisy_capture["final_hidden_state"][1:].clone())
+        noisy_suffix_hidden_parts.append(noisy_capture["suffix_hidden_states"][1:].clone())
+        noisy_next_token_logits_parts.append(noisy_capture["next_token_logits"][1:].clone())
+        completed_here += noisy_batch_size
         completed_total = completed_trials_before + completed_here
-        if completed_total % args.log_every == 0:
+        if completed_total % args.log_every == 0 or completed_here == len(noise_seeds):
             print(
-                f"[greedy-gaussian] trials={completed_total}, question={question_index}, "
-                f"position={response_position}, position_W2R={sum(is_w2r)}/{completed_here}",
+                f"[greedy-gaussian-code-parallel] trials={completed_total}, "
+                f"question={question_index}, position={response_position}, "
+                f"position_W2R={sum(is_w2r)}/{completed_here}, "
+                f"gpu_noisy_batch={noisy_batch_size}",
                 flush=True,
             )
 
@@ -898,8 +988,11 @@ def collect_one_response_position(
     applied_noise_tensor = torch.cat(applied_noise_parts, dim=0)
     noisy_final_tensor = torch.cat(noisy_final_parts, dim=0)
     noisy_suffix_hidden_tensor = torch.cat(noisy_suffix_hidden_parts, dim=0)
-    delta_suffix_hidden_tensor = noisy_suffix_hidden_tensor - clean_suffix_hidden_states.unsqueeze(0)
     noisy_next_token_logits_tensor = torch.cat(noisy_next_token_logits_parts, dim=0)
+    delta_suffix_hidden_tensor = (
+        noisy_suffix_hidden_tensor - clean_suffix_hidden_states.unsqueeze(0)
+    )
+
     expected_shape = (len(noise_seeds), hidden_size)
     expected_suffix_shape = (len(noise_seeds), expected_suffix_depth, hidden_size)
     expected_logits_shape = (len(noise_seeds), vocab_size)
@@ -925,59 +1018,71 @@ def collect_one_response_position(
         )
     }
     if malformed:
-        raise RuntimeError(f"Collected tensor shapes do not match {expected_shape}: {malformed}")
-    if not (
-        torch.isfinite(clean_hidden_state).all()
-        and torch.isfinite(clean_final_hidden_state).all()
-        and torch.isfinite(clean_suffix_hidden_states).all()
-        and torch.isfinite(clean_next_token_logits).all()
-        and torch.isfinite(standard_normal_noise_tensor).all()
-        and torch.isfinite(sampled_noise_tensor).all()
-        and torch.isfinite(applied_noise_tensor).all()
-        and torch.isfinite(noisy_final_tensor).all()
-        and torch.isfinite(noisy_suffix_hidden_tensor).all()
-        and torch.isfinite(delta_suffix_hidden_tensor).all()
-        and torch.isfinite(noisy_next_token_logits_tensor).all()
-    ):
-        raise RuntimeError(f"Non-finite hidden state or noise collected at row {row_index}, position {response_position}")
+        raise RuntimeError(f"Parallel collected tensor shapes are malformed: {malformed}")
+    tensors_to_check = (
+        clean_hidden_state,
+        clean_final_hidden_state,
+        clean_suffix_hidden_states,
+        clean_next_token_logits,
+        standard_normal_noise_tensor,
+        sampled_noise_tensor,
+        applied_noise_tensor,
+        noisy_final_tensor,
+        noisy_suffix_hidden_tensor,
+        delta_suffix_hidden_tensor,
+        noisy_next_token_logits_tensor,
+    )
+    if not all(torch.isfinite(tensor).all() for tensor in tensors_to_check):
+        raise RuntimeError(
+            f"Non-finite state/noise in parallel code batch at row={row_index}, "
+            f"position={response_position}"
+        )
 
     first_suffix_delta_vs_applied_max_diff = float(
-        (delta_suffix_hidden_tensor[:, 0, :] - applied_noise_tensor).abs().max().item()
+        (delta_suffix_hidden_tensor[:, 0, :] - applied_noise_tensor)
+        .abs()
+        .max()
+        .item()
     )
     final_suffix_delta = noisy_final_tensor - clean_final_hidden_state.unsqueeze(0)
     final_suffix_delta_max_diff = float(
-        (delta_suffix_hidden_tensor[:, -1, :] - final_suffix_delta).abs().max().item()
+        (delta_suffix_hidden_tensor[:, -1, :] - final_suffix_delta)
+        .abs()
+        .max()
+        .item()
     )
     if first_suffix_delta_vs_applied_max_diff != 0 or final_suffix_delta_max_diff != 0:
         raise RuntimeError(
-            f"Suffix trace endpoint validation failed at row={row_index}, position={response_position}: "
-            f"first_vs_applied={first_suffix_delta_vs_applied_max_diff}, "
-            f"final_vs_lm_head={final_suffix_delta_max_diff}."
+            f"Parallel suffix trace endpoint validation failed at row={row_index}, "
+            f"position={response_position}: first={first_suffix_delta_vs_applied_max_diff}, "
+            f"final={final_suffix_delta_max_diff}"
         )
 
     coordinate_stds = standard_normal_noise_tensor.std(dim=1, unbiased=False)
     min_coordinate_std = float(coordinate_stds.min().item())
     unique_noise_vectors = len(set(noise_hashes))
-    if min_coordinate_std <= 0:
+    if min_coordinate_std <= 0 or unique_noise_vectors != len(noise_seeds):
         raise RuntimeError(
-            f"A Gaussian trial has zero across-coordinate variance at row={row_index}, "
-            f"position={response_position}; this would indicate scalar broadcasting."
-        )
-    if unique_noise_vectors != len(noise_seeds):
-        raise RuntimeError(
-            f"Expected {len(noise_seeds)} distinct noise vectors but found "
-            f"{unique_noise_vectors} at row={row_index}, position={response_position}."
+            f"Invalid Gaussian batch at row={row_index}, position={response_position}: "
+            f"minimum_coordinate_std={min_coordinate_std}, "
+            f"unique={unique_noise_vectors}/{len(noise_seeds)}"
         )
 
+    zero_control_trials = execution_batch_size + noisy_batch_count
     diagnostics = {
-        "strict_clean_regeneration_matches_original_greedy": True,
-        "zero_noise_tokens_match_original_greedy": True,
-        "zero_noise_max_pre_hidden_vs_clean_abs_diff": zero_pre_diff,
-        "zero_noise_max_applied_abs": zero_applied_max,
-        "zero_noise_max_final_hidden_vs_clean_abs_diff": zero_final_diff,
-        "zero_noise_max_suffix_hidden_vs_clean_abs_diff": zero_suffix_diff,
-        "zero_noise_max_next_token_logits_vs_clean_abs_diff": zero_logits_diff,
+        "fixed_shape_clean_tokens_match_all_batch_controls": True,
+        "matched_zero_control_in_every_noisy_batch": True,
+        "fixed_execution_batch_shape": True,
+        "noisy_trials_per_gpu_batch": noisy_batch_size,
+        "execution_batch_size_including_control": execution_batch_size,
+        "number_of_noisy_gpu_batches": noisy_batch_count,
+        "zero_noise_control_trials": zero_control_trials,
+        "all_zero_control_batch_spreads": control_spreads,
         "max_pre_noise_hidden_vs_clean_abs_diff": max_pre_noise_difference,
+        "max_in_batch_zero_applied_abs": max_zero_applied_abs,
+        "max_in_batch_zero_final_hidden_abs_diff": max_zero_final_difference,
+        "max_in_batch_zero_suffix_hidden_abs_diff": max_zero_suffix_difference,
+        "max_in_batch_zero_logits_abs_diff": max_zero_logits_difference,
         "noisy_prefix_through_target_matches_clean": True,
         "first_causally_changeable_response_position": response_position + 1,
         "noise_coordinates_sampled_iid": True,
@@ -994,60 +1099,59 @@ def collect_one_response_position(
     }
 
     question_w2r = sum(is_w2r)
+    common_metadata = {
+        "input_parquet": str(args.input_parquet),
+        "model": args.model,
+        "row_index": row_index,
+        "problem_index": problem_index,
+        "question_index": question_index,
+        "question_fingerprint": record_question_fingerprint,
+        "data_source": record["data_source"],
+        "ground_truth": record["reward_model"]["ground_truth"],
+        "prompt": record["prompt"],
+        "injection_layer": layer_idx,
+        "response_position": response_position,
+        "response_position_fraction": response_position / len(clean_response_token_ids),
+        "response_position_indexing": "one_based",
+        "clean_response_length": len(clean_response_token_ids),
+        "injection_location": "decoder_layer_output/response_token/batched_full_path_once",
+        "first_causally_changeable_response_position": response_position + 1,
+        "suffix_capture_scope": "same_target_token_from_injection_layer_through_final_norm",
+        "suffix_decoder_layer_indices": suffix_decoder_layer_indices,
+        "suffix_decoder_layer_indexing": "zero_based",
+        "suffix_state_labels": suffix_state_labels,
+        "suffix_trace_tensor_layout": "[state, hidden] clean; [trial, state, hidden] noisy/delta",
+        "logits_capture_scope": "raw_lm_head_output_for_response_token_p_plus_1",
+        "logits_tensor_layout": "[vocabulary] clean; [trial, vocabulary] noisy",
+        "logits_saved_dtype": "float32",
+        "vocab_size": vocab_size,
+        "noise_distribution": "isotropic_gaussian_iid_per_hidden_coordinate",
+        "noise_seed_mode": args.noise_seed_mode,
+        "noise_namespace": args.noise_namespace.strip(),
+        "noise_coordinate_sampling": "torch.randn(hidden_size), not scalar broadcasting",
+        "noise_std": float(args.noise_std),
+        "noise_scale_mode": args.noise_scale_mode,
+        "clean_hidden_rms": clean_hidden_rms,
+        "effective_noise_std_hidden_units": effective_noise_std,
+        "model_dtype": args.dtype,
+        "enable_thinking": args.enable_thinking,
+        "generation_eos_token_ids": generation_eos_token_ids(model, tokenizer),
+        "noisy_trial_batch_size": noisy_batch_size,
+        "execution_batch_size_including_control": execution_batch_size,
+        "input_rollout_filter_source": input_rollout_filter_source,
+        "scoring_mode": "binary_pass_all_tests",
+    }
     shard = {
         "format_version": FORMAT_VERSION,
-        "metadata": {
-            "input_parquet": str(args.input_parquet),
-            "model": args.model,
-            "row_index": row_index,
-            "problem_index": problem_index,
-            "question_index": question_index,
-            "question_fingerprint": record_question_fingerprint,
-            "data_source": record["data_source"],
-            "ground_truth": record["reward_model"]["ground_truth"],
-            "prompt": record["prompt"],
-            "injection_layer": layer_idx,
-            "response_position": response_position,
-            "response_position_fraction": response_position / len(clean_response_token_ids),
-            "response_position_indexing": "one_based",
-            "clean_response_length": len(clean_response_token_ids),
-            "injection_location": "decoder_layer_output/response_token/full_clean_greedy_path_once",
-            "first_causally_changeable_response_position": response_position + 1,
-            "final_state_location": "lm_head_input/same_target_forward",
-            "suffix_capture_scope": "same_target_token_from_injection_layer_through_final_norm",
-            "suffix_decoder_layer_indices": suffix_decoder_layer_indices,
-            "suffix_decoder_layer_indexing": "zero_based",
-            "suffix_state_labels": suffix_state_labels,
-            "suffix_trace_tensor_layout": "[state, hidden] clean; [trial, state, hidden] noisy/delta",
-            "logits_capture_scope": "raw_lm_head_output_for_response_token_p_plus_1",
-            "logits_source_state": "final_norm_lm_head_input/same_target_forward",
-            "logits_tensor_layout": "[vocabulary] clean; [trial, vocabulary] noisy",
-            "logits_saved_dtype": "float32",
-            "vocab_size": vocab_size,
-            "noise_distribution": "isotropic_gaussian_iid_per_hidden_coordinate",
-            "noise_seed_mode": args.noise_seed_mode,
-            "noise_namespace": args.noise_namespace.strip(),
-            "noise_coordinate_sampling": "torch.randn(hidden_size), not scalar broadcasting",
-            "noise_std": float(args.noise_std),
-            "noise_scale_mode": args.noise_scale_mode,
-            "clean_hidden_rms": clean_hidden_rms,
-            "effective_noise_std_hidden_units": effective_noise_std,
-            "model_dtype": args.dtype,
-            "trial_batch_size": 1,
-            "input_rollout_filter_source": input_rollout_filter_source,
-            "scoring_mode": (
-                "binary_pass_all_tests"
-                if is_code_data_source(record["data_source"])
-                else "task_default"
-            ),
-        },
+        "metadata": common_metadata,
         "prompt_token_ids": torch.tensor(prompt_token_ids, dtype=torch.long),
         "clean_response_token_ids": torch.tensor(clean_response_token_ids, dtype=torch.long),
         "fixed_response_prefix_token_ids": torch.tensor(fixed_response_prefix_ids, dtype=torch.long),
         "clean_hidden_state": clean_hidden_state,
         "clean_final_hidden_state": clean_final_hidden_state,
         "suffix_decoder_layer_indices": torch.tensor(
-            suffix_decoder_layer_indices, dtype=torch.long
+            suffix_decoder_layer_indices,
+            dtype=torch.long,
         ),
         "suffix_state_labels": suffix_state_labels,
         "clean_suffix_hidden_states": clean_suffix_hidden_states,
@@ -1055,7 +1159,7 @@ def collect_one_response_position(
         "baseline_response": baseline_response,
         "baseline_score": float(baseline_score),
         "zero_noise_control": {
-            "trials": 1,
+            "trials": zero_control_trials,
             "all_token_sequences_match_clean": True,
             "all_suffix_hidden_states_match_clean": True,
             "all_next_token_logits_match_clean": True,
@@ -1077,7 +1181,6 @@ def collect_one_response_position(
         "is_w2r": torch.tensor(is_w2r, dtype=torch.bool),
         "diagnostics": diagnostics,
     }
-
     manifest_record = {
         "format_version": FORMAT_VERSION,
         "question_index": question_index,
@@ -1111,15 +1214,13 @@ def collect_one_response_position(
         "clean_hidden_rms": clean_hidden_rms,
         "effective_noise_std_hidden_units": effective_noise_std,
         "num_noise_seeds": len(noise_seeds),
-        "zero_noise_control_trials": 1,
+        "noisy_trial_batch_size": noisy_batch_size,
+        "execution_batch_size_including_control": execution_batch_size,
+        "zero_noise_control_trials": zero_control_trials,
         "zero_noise_control_w2r_count": 0,
         "zero_noise_control_w2r_rate": 0.0,
         "baseline_score": float(baseline_score),
-        "scoring_mode": (
-            "binary_pass_all_tests"
-            if is_code_data_source(record["data_source"])
-            else "task_default"
-        ),
+        "scoring_mode": "binary_pass_all_tests",
         "w2r_count": question_w2r,
         "w2r_rate": question_w2r / len(noise_seeds),
         "diagnostics": diagnostics,
@@ -1133,11 +1234,6 @@ def main() -> None:
         raise ValueError("--noise-std must be positive")
     if args.num_noise_seeds <= 0 or args.noise_batch_size <= 0 or args.max_questions <= 0:
         raise ValueError("--num-noise-seeds, --noise-batch-size, and --max-questions must be positive")
-    if args.noise_batch_size != 1:
-        raise ValueError(
-            "Strict full-path W2R requires --noise-batch-size 1 so clean and noisy trials use the same "
-            "batch-1 greedy computation path. Do not batch noise seeds in this mode."
-        )
     if args.max_new_tokens <= 0 or args.max_input_tokens <= 0 or args.log_every <= 0:
         raise ValueError("--max-new-tokens, --max-input-tokens, and --log-every must be positive")
     if args.response_position is not None and args.response_position <= 0:
@@ -1157,6 +1253,11 @@ def main() -> None:
     noise_seed_bank = explicit_seeds or [
         args.base_noise_seed + offset for offset in range(args.num_noise_seeds)
     ]
+    if len(noise_seed_bank) % args.noise_batch_size != 0:
+        raise ValueError(
+            f"The effective noise seed count ({len(noise_seed_bank)}) must be divisible by "
+            f"--noise-batch-size ({args.noise_batch_size}) so every GPU call has an identical shape"
+        )
     row_indices = set(parse_int_list(args.row_indices, "--row-indices")) if args.row_indices.strip() else None
     if any(seed < 0 for seed in noise_seed_bank):
         raise ValueError("Noise seeds must be non-negative")
@@ -1198,18 +1299,17 @@ def main() -> None:
     missing = required_columns - set(df.columns)
     if missing:
         raise ValueError(f"Input parquet is missing required columns: {sorted(missing)}")
-    code_sources = sorted(
+    unsupported_sources = sorted(
         {
             str(source)
             for source in df["data_source"].tolist()
-            if is_code_data_source(source)
+            if not is_code_data_source(source)
         }
     )
-    if code_sources:
+    if unsupported_sources:
         raise ValueError(
-            "The batch-1 v8 collector is reserved for math/non-code experiments. "
-            "Run probe/run_greedy_wrong_gaussian_probe_v8_code.sh for code data. "
-            f"Detected code data_source values: {code_sources}"
+            "The parallel code collector accepts code datasets only; unsupported data_source "
+            f"values: {unsupported_sources}"
         )
     if row_indices is not None:
         absent = sorted(row_indices - set(range(len(df))))
@@ -1244,20 +1344,35 @@ def main() -> None:
                     continue
 
             try:
-                token_ids = prompt_ids(tokenizer, record["prompt"], args.max_input_tokens)
+                token_ids = prompt_ids(
+                    tokenizer,
+                    record["prompt"],
+                    args.max_input_tokens,
+                    args.enable_thinking,
+                )
             except (TypeError, ValueError) as exc:
                 exclusions[f"invalid_prompt:{type(exc).__name__}"] += 1
                 continue
 
-            print(f"[greedy-gaussian] row={row_index}: running clean greedy baseline", flush=True)
+            clean_execution_batch_size = args.noise_batch_size + 1
+            print(
+                f"[greedy-gaussian] row={row_index}: running fixed-shape clean greedy "
+                f"baseline (batch={clean_execution_batch_size})",
+                flush=True,
+            )
             baseline_token_batches = greedy_generate_batch(
                 model,
                 tokenizer,
                 token_ids,
-                1,
+                clean_execution_batch_size,
                 args.max_new_tokens,
                 device,
             )
+            if any(tokens != baseline_token_batches[0] for tokens in baseline_token_batches[1:]):
+                raise RuntimeError(
+                    f"Identical clean rows diverged inside the same fixed-shape batch at "
+                    f"row={row_index}, batch={clean_execution_batch_size}."
+                )
             clean_response_token_ids = baseline_token_batches[0]
             if not clean_response_token_ids:
                 exclusions["empty_greedy_response"] += 1
@@ -1321,7 +1436,7 @@ def main() -> None:
             completed_positions = 0
             for response_position in response_positions:
                 position_noise_seeds = position_noise_seed_map[response_position]
-                shard, manifest_record, position_trials, position_w2r = collect_one_response_position(
+                shard, manifest_record, position_trials, position_w2r = collect_one_response_position_parallel(
                     args=args,
                     model=model,
                     tokenizer=tokenizer,
@@ -1371,6 +1486,7 @@ def main() -> None:
                     "problem_index": problem_index,
                     "question_fingerprint": record_question_fingerprint,
                     "clean_response_length": len(clean_response_token_ids),
+                    "clean_baseline_batch_size": clean_execution_batch_size,
                     "selected_response_positions": response_positions,
                     "effective_noise_seed_count": len(effective_question_noise_seeds),
                     "unique_effective_noise_seed_count": unique_effective_question_noise_seed_count,
@@ -1396,6 +1512,8 @@ def main() -> None:
         "format_version": FORMAT_VERSION,
         "input_parquet": str(args.input_parquet),
         "model": args.model,
+        "enable_thinking": args.enable_thinking,
+        "generation_eos_token_ids": generation_eos_token_ids(model, tokenizer),
         "output_dir": str(args.output_dir),
         "injection_layer": layer_idx,
         "decoder_layer_count": len(layers),
@@ -1430,8 +1548,13 @@ def main() -> None:
             )
         ),
         "noise_coordinate_sampling": "iid torch.randn(hidden_size), never scalar broadcasting",
+        "task_family": "code_only",
         "code_scoring_mode": "binary_pass_all_tests",
-        "noise_batch_size": args.noise_batch_size,
+        "parallel_rollout": True,
+        "clean_baseline_batch_size": args.noise_batch_size + 1,
+        "noisy_trial_batch_size": args.noise_batch_size,
+        "execution_batch_size_including_control": args.noise_batch_size + 1,
+        "matched_zero_control_in_every_noisy_batch": True,
         "require_all_input_rollouts_wrong": args.require_all_input_rollouts_wrong,
         "accepted_questions": accepted,
         "completed_response_positions": len(question_summaries),

@@ -18,12 +18,30 @@ together without duplicating VERL's framework implementation.
   zero-noise group defines the position-level clean baseline and must reproduce
   its tokens and states exactly; positions whose replay is already correct are
   skipped rather than counted as W2R.
-- `probe/run_greedy_wrong_gaussian_probe_v8.py`: strict full-path v8 collector
-  that saves clean/noisy suffix-layer states, deltas, logits, responses, scores,
-  and auditable per-position manifests.
-- `probe/run_greedy_wrong_gaussian_probe_v8_code.sh`: code-dataset launcher.
-  Its default `independent` seed mode gives every `(question, position, trial)`
-  a distinct Gaussian vector while remaining exactly reproducible.
+- `probe/run_greedy_wrong_gaussian_probe_v8.py`: strict batch-1 math/non-code
+  collector. It rejects code datasets so serial math and parallel code results
+  cannot be accidentally mixed.
+- `probe/run_greedy_wrong_gaussian_probe_v9_code_parallel.py`: code-only
+  collector that evaluates multiple independent noisy rollouts in one GPU
+  batch and saves suffix-layer states, deltas, logits, responses, scores, and
+  auditable controls.
+- `probe/run_greedy_wrong_gaussian_probe_v9_code_parallel.sh`: launcher for the parallel
+  code collector. Its default `independent` seed mode gives every
+  `(question, position, trial)` a distinct Gaussian vector. Every noisy GPU
+  batch also contains a matched zero-noise row, and the collector aborts if
+  that row or any pre-intervention prefix differs from clean greedy.
+- `probe/run_greedy_wrong_gaussian_probe_v8_code.sh`: compatibility alias that
+  immediately forwards to the v9 parallel launcher; it no longer contains a
+  serial code experiment.
+- `probe/run_two_scripts_2gpu.sh`: assigns two different shell scripts to two
+  GPUs, launches them concurrently, keeps separate logs, and propagates either
+  worker's failure status.
+- `probe/run_first_divergent_token_replay.py`: consumes completed strict
+  batch-1 V8 shards, exactly reproduces selected W2R and matched changed-wrong
+  trajectories, and runs the clean/noisy-state x clean/source-token-prefix
+  counterfactual replay. The launcher is
+  `probe/run_first_divergent_token_replay.sh`; the full protocol is documented
+  in `BRANCH_REPLAY_EXPERIMENT.md`.
 - `scripts/data/download_prepare_apps.py`: reproducibly shuffle and prepare a
   small APPS parquet without relying on deprecated Hugging Face dataset scripts.
 - `analysis/run_exact_difficulty_summary.sh`: clean-32-rollout difficulty
@@ -62,6 +80,50 @@ For code experiments, correctness means passing every executable test case.
 Run generated programs only in an isolated container. The code launcher accepts
 `apps`, `taco`, `codecontests`, `codeforces`, and `livecodebench/*` sources and
 defaults to independent directions across questions and response positions.
+`NOISE_BATCH_SIZE=8` means eight noisy rollouts plus one matched zero-control
+row per model call; the clean greedy baseline is also generated with that same
+9-row execution shape. This avoids treating batch-shape numerical drift as a
+noise effect. `NUM_NOISE_SEEDS` must be divisible by the noisy batch size.
+Parallel code outputs use `greedy_gaussian_w2r_parallel/` and a v9 format
+identifier. Treat earlier serial code outputs as a separate pilot rather than
+pooling them with this dataset.
+
+The code launcher defaults to `ENABLE_THINKING=false`. This is passed into the
+chat template as `enable_thinking=False`, which avoids Qwen3's unsupported
+thinking-plus-greedy combination. It also preserves all EOS IDs from the model
+generation configuration instead of replacing them with one tokenizer ID.
+
+A minimal one-position smoke test on one code question is:
+
+```bash
+INPUT_PARQUET=/path/to/apps_competition_test_100.parquet \
+MODEL_PATH=/path/to/Qwen3-8B \
+MAX_QUESTIONS=1 \
+NUM_RESPONSE_POSITIONS=1 \
+NUM_NOISE_SEEDS=8 \
+NOISE_BATCH_SIZE=8 \
+bash probe/run_greedy_wrong_gaussian_probe_v9_code_parallel.sh
+```
+
+After that succeeds, use `MAX_QUESTIONS=20`, `NUM_RESPONSE_POSITIONS=10`, and
+`NUM_NOISE_SEEDS=32`. Start with `NOISE_BATCH_SIZE=8`; try 16 only after an
+8-row smoke test fits GPU memory. `MODEL_PATH` is required explicitly so a code
+run cannot silently fall back to the math checkpoint.
+
+To launch two already-configured, different scripts on separate GPUs:
+
+```bash
+bash probe/run_two_scripts_2gpu.sh \
+  probe/first_experiment.sh \
+  probe/second_experiment.sh
+```
+
+The first script receives `CUDA_VISIBLE_DEVICES=0`; the second receives
+`CUDA_VISIBLE_DEVICES=1`. Override those physical IDs with `GPU0_ID` and
+`GPU1_ID`. Both child scripts must respect the inherited variable (for example,
+`export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"`) rather than
+unconditionally resetting it. Each child remains responsible for using a
+distinct experiment/output directory.
 
 All launchers default to the current project's `verl/` source tree.  Set
 `VERL_ROOT=/path/to/noise_experiments/verl` to run from the complete backup
